@@ -1,0 +1,35 @@
+import { entity as NotesChart } from './charts/entities/notes.js';
+import { entity as UsersChart } from './charts/entities/users.js';
+import { entity as ActiveUsersChart } from './charts/entities/active-users.js';
+import { entity as InstanceChart } from './charts/entities/instance.js';
+import { entity as PerUserNotesChart } from './charts/entities/per-user-notes.js';
+import { entity as DriveChart } from './charts/entities/drive.js';
+import { entity as PerUserReactionsChart } from './charts/entities/per-user-reactions.js';
+import { entity as HashtagChart } from './charts/entities/hashtag.js';
+import { entity as PerUserFollowingChart } from './charts/entities/per-user-following.js';
+import { entity as PerUserDriveChart } from './charts/entities/per-user-drive.js';
+
+import { entity as TestChart } from './charts/entities/test.js';
+import { entity as TestGroupedChart } from './charts/entities/test-grouped.js';
+import { entity as TestUniqueChart } from './charts/entities/test-unique.js';
+import { entity as TestIntersectionChart } from './charts/entities/test-intersection.js';
+
+export const entities = [
+	NotesChart.hour, NotesChart.day,
+	UsersChart.hour, UsersChart.day,
+	ActiveUsersChart.hour, ActiveUsersChart.day,
+	InstanceChart.hour, InstanceChart.day,
+	PerUserNotesChart.hour, PerUserNotesChart.day,
+	DriveChart.hour, DriveChart.day,
+	PerUserReactionsChart.hour, PerUserReactionsChart.day,
+	HashtagChart.hour, HashtagChart.day,
+	PerUserFollowingChart.hour, PerUserFollowingChart.day,
+	PerUserDriveChart.hour, PerUserDriveChart.day,
+
+	...(process.env.NODE_ENV === 'test' ? [
+		TestChart.hour, TestChart.day,
+		TestGroupedChart.hour, TestGroupedChart.day,
+		TestUniqueChart.hour, TestUniqueChart.day,
+		TestIntersectionChart.hour, TestIntersectionChart.day,
+	] : []),
+];

@@ -1,0 +1,41 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "64ZCASRLNC.chat.campra.app",
+        "paths": ["*"],
+        "components": [
+          {
+            "/": "/verify-email/*",
+            "exclude": true
+          },
+          {
+            "/": "/miauth/*",
+            "exclude": true
+          },
+          {
+            "/": "/statusbar",
+            "exclude": true
+          },
+          {
+            "/": "/sounds",
+            "exclude": true
+          },
+          {
+            "/": "/plugin/*",
+            "exclude": true
+          },
+          {
+            "/": "/miauth/*",
+            "exclude": true
+          },
+          {
+            "/": "/api/*",
+            "exclude": true
+          }
+        ]
+      }
+    ]
+  }
+}

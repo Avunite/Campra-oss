@@ -1,0 +1,44 @@
+version: "3"
+
+services:
+  web:
+    image: campra-v4
+    container_name: campra_web
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "3000:3000"
+    networks:
+      - campra
+    environment:
+      NODE_ENV: development
+      DEBUG: "*"
+    volumes:
+      - ./files:/campra/files
+      - ./.config:/campra/.config:ro
+    command: ["pnpm", "run", "dev"]
+
+  redis:
+    restart: unless-stopped
+    image: docker.io/redis:7.0-alpine
+    container_name: campra_redis
+    networks:
+      - campra
+    volumes:
+      - ./redis:/data
+
+  db:
+    restart: unless-stopped
+    image: docker.io/postgres:12.2-alpine
+    container_name: campra_db
+    networks:
+      - campra
+    env_file:
+      - .config/docker.env
+    volumes:
+      - ./db:/var/lib/postgresql/data
+
+networks:
+  campra:

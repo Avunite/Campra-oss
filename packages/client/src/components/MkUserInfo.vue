@@ -1,0 +1,154 @@
+<template>
+<div class="_panel vjnjpkug">
+	<div class="banner" :style="user.bannerUrl ? `background-image: url(${user.bannerUrl})` : ''"></div>
+	<MkAvatar class="avatar" :user="user" :disable-preview="true" :show-indicator="true"/>
+	<div class="title">
+		<MkA class="name" :to="userPage(user)"><MkUserName :user="user" :nowrap="false"/></MkA>
+		<div class="username-container">
+			<p class="username">
+				<MkAcct :user="user"/>
+				<span v-if="user.school" v-tooltip="user.school.name" class="school-badge">
+					<img v-if="user.school.logoUrl" :src="user.school.logoUrl" :alt="user.school.name" class="school-logo"/>
+					<i v-else class="ph-graduation-cap-bold ph-lg school-icon"></i>
+				</span>
+			</p>
+		</div>
+	</div>
+	<div class="description">
+		<div v-if="user.description" class="mfm">
+			<Mfm :text="user.description" :author="user" :i="$i" :custom-emojis="user.emojis"/>
+		</div>
+		<span v-else style="opacity: 0.7;">{{ i18n.ts.noAccountDescription }}</span>
+	</div>
+	<div class="status">
+		<div>
+			<p>{{ i18n.ts.notes }}</p><span>{{ user.notesCount }}</span>
+		</div>
+		<div>
+			<p>{{ i18n.ts.following }}</p><span>{{ user.followingCount }}</span>
+		</div>
+		<div>
+			<p>{{ i18n.ts.followers }}</p><span>{{ user.followersCount }}</span>
+		</div>
+	</div>
+	<MkFollowButton v-if="$i && user.id != $i.id" class="koudoku-button" :user="user" mini/>
+</div>
+</template>
+
+<script lang="ts" setup>
+import * as misskey from 'calckey-js';
+import MkFollowButton from '@/components/MkFollowButton.vue';
+import { userPage } from '@/filters/user';
+import { i18n } from '@/i18n';
+
+defineProps<{
+	user: misskey.entities.UserDetailed;
+}>();
+</script>
+
+<style lang="scss" scoped>
+.vjnjpkug {
+	position: relative;
+
+	> .banner {
+		height: 84px;
+		background-color: rgba(0, 0, 0, 0.1);
+		background-size: cover;
+		background-position: center;
+	}
+
+	> .avatar {
+		display: block;
+		position: absolute;
+		top: 62px;
+		left: 13px;
+		z-index: 2;
+		width: 58px;
+		height: 58px;
+		border: solid 3px var(--face);
+		border-radius: 8px;
+	}
+
+	> .title {
+		display: block;
+		padding: 8px 0 8px 82px;
+
+		> .name {
+			display: inline-block;
+			margin: 0;
+			font-weight: bold;
+			line-height: 16px;
+			word-break: break-all;
+		}
+
+		> .username-container {
+			> .username {
+				display: flex;
+				align-items: center;
+				margin: 0;
+				line-height: 16px;
+				font-size: 0.8em;
+				color: var(--fg);
+				opacity: 0.7;
+
+				> .school-badge {
+					margin-left: 4px;
+					display: inline-flex;
+					align-items: center;
+
+					> .school-logo {
+						width: 16px;
+						height: 16px;
+						border-radius: 2px;
+					}
+
+					> .school-icon {
+						color: var(--accent);
+						font-size: 14px;
+					}
+				}
+			}
+		}
+	}
+
+	> .description {
+		padding: 16px;
+		font-size: 0.8em;
+		border-top: solid 0.5px var(--divider);
+
+		> .mfm {
+			display: -webkit-box;
+			-webkit-line-clamp: 3;
+			-webkit-box-orient: vertical;
+			overflow: hidden;
+		}
+	}
+
+	> .status {
+		padding: 10px 16px;
+		border-top: solid 0.5px var(--divider);
+
+		> div {
+			display: inline-block;
+			width: 33%;
+
+			> p {
+				margin: 0;
+				font-size: 0.7em;
+				color: var(--fg);
+			}
+
+			> span {
+				font-size: 1em;
+				color: var(--accent);
+			}
+		}
+	}
+
+	> .koudoku-button {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+	}
+}
+</style>

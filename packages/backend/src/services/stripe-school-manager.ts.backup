@@ -1,0 +1,1141 @@
+/**
+ * DEPRECATED: This file is kept for backwards compatibility only
+ * All new code should import from '@/services/stripe'
+ * 
+ * The monolithic StripeSchoolManager has been refactored into modular services:
+ * - SubscriptionService: Handles subscription creation and management
+ * - CustomerService: Handles Stripe customer operations
+ * - PricingService: Handles price creation and caching
+ * - BillingService: Handles billing calculations and records
+ * - StripeManager: Main orchestrator that ties everything together
+ */
+
+export { StripeManager as StripeSchoolManager } from './stripe/index.js';
+export { getSchoolBillingRate } from './stripe/types.js';
+
+// Keep old exports for any code that might be using them directly
+export type { BillingCalculation, SubscriptionCreationResult } from './stripe/types.js';
+
+/**
+ * School-based Stripe billing manager for Campra platform
+ * Handles $1.25 per student per year subscription model
+ */
+export class StripeSchoolManager {
+    private stripe: Stripe;
+    
+    constructor(apiKey: string) {
+        this.stripe = new Stripe(apiKey, {
+            apiVersion: '2024-06-20',
+        });
+    }
+    
+    /**
+     * Initialize Stripe instance from meta configuration
+     */
+    static async initialize(): Promise<StripeSchoolManager> {
+        const meta = await fetchMeta();
+        if (!meta.stripeKey) {
+            throw new Error('Stripe API key not configured');
+        }
+        return new StripeSchoolManager(meta.stripeKey);
+    }
+    
+    /**
+     * Get billing rate for a specific school (supports custom rates)
+     */
+    getSchoolBillingRate(school: School): number {
+        // Check for admin override (free access) - but don't apply if school has chosen to pay
+        const isFree = (school.metadata?.adminOverride || school.metadata?.freeActivation) && 
+                       !school.metadata?.paidSubscriptionDespiteFree;
+        if (isFree) {
+            return 0;
+        }
+        
+        // Check for custom rate in metadata
+        if (school.metadata?.customBillingRate) {
+            return school.metadata.customBillingRate;
+        }
+        
+        // Check for discount percentage
+        if (school.metadata?.discountPercentage) {
+            const discount = school.metadata.discountPercentage / 100;
+            const discountedRate = 1.25 * (1 - discount);
+            // Round to 2 decimal places to avoid floating point precision issues
+            return Math.round(discountedRate * 100) / 100;
+        }
+        
+        // Return standard rate
+        return 1.25;
+    }
+    
+    /**
+     * Calculate annual billing amount for a school
+     */
+    async calculateSchoolBilling(schoolId: string): Promise<{ studentCount: number; rate: number; totalAmount: number }> {
+        const school = await Schools.findOneBy({ id: schoolId });
+        if (!school) {
+            throw new Error(`School not found with ID: ${schoolId}`);
+        }
+
+        // All schools must have caps in the new system
+        if (school.studentCap === null || !school.studentCapEnforced) {
+            throw new Error(`School ${schoolId} does not have a student cap configured. All schools must have caps.`);
+        }
+
+        const rate = this.getSchoolBillingRate(school);
+        
+        // Always use the cap for billing calculation in prepaid system
+        const billingCount = school.studentCap;
+        const totalAmount = billingCount * rate;
+        
+        return {
+            studentCount: billingCount,
+            rate,
+            totalAmount,
+        };
+    }
+    
+    /**
+     * Get current student count for a school
+     * Excludes school staff, teachers, alumni, and platform staff from billing
+     */
+    async getSchoolStudentCount(schoolId: string): Promise<number> {
+        return await Users.count({
+            where: {
+                schoolId: schoolId,
+                enrollmentStatus: 'active',
+                isAlumni: false,
+                isSchoolAdmin: false, // Exclude school admins
+                isTeacher: false, // Exclude teachers
+				billingExempt: false, // Exclude billing exempt users
+            },
+        });
+    }
+    
+    /**
+     * Create Stripe customer for a school
+     */
+    async createSchoolCustomer(school: School): Promise<string> {
+        logger.info(`Creating Stripe customer for school: ${school.name}`);
+        
+        const customer = await this.stripe.customers.create({
+            name: school.name,
+            email: `billing@${school.domain}`, // Use school domain for billing
+            metadata: {
+                schoolId: school.id,
+                schoolDomain: school.domain,
+                type: 'school',
+            },
+        });
+        
+        logger.info(`Created Stripe customer ${customer.id} for school ${school.id}`);
+        return customer.id;
+    }
+    
+    /**
+     * Create school subscription with dynamic pricing based on student count
+     */
+    async createSchoolSubscription(
+        schoolId: string,
+        paymentMethodId?: string,
+        forceUpgradeFromFree: boolean = false
+    ): Promise<{ subscription: Stripe.Subscription | null; billing: SchoolBilling }> {
+        // Use a database transaction to prevent race conditions from double-clicking
+        return await db.transaction(async (transactionalEntityManager: any) => {
+            const school = await transactionalEntityManager.findOneByOrFail(School, { id: schoolId });
+            
+            // All schools must have caps configured in the new system
+            if (school.studentCap === null || !school.studentCapEnforced) {
+                throw new Error(`Cannot create subscription for school ${schoolId}: Student cap must be configured first.`);
+            }
+            
+            // Check for existing active or incomplete billing to prevent multiple subscriptions
+            // Use FOR UPDATE to lock the row and prevent concurrent creation
+            const existingActiveBilling = await transactionalEntityManager
+                .createQueryBuilder(SchoolBilling, "billing")
+                .where("billing.schoolId = :schoolId AND billing.status IN (:...statuses)", { 
+                    schoolId: schoolId,
+                    statuses: ['active', 'incomplete', 'trialing']
+                })
+                .orderBy("billing.createdAt", "DESC")
+                .setLock("pessimistic_write") // This prevents race conditions
+                .getOne();
+            
+            if (existingActiveBilling) {
+                // If we have an active or incomplete subscription, don't create another one
+                if (existingActiveBilling.stripeSubscriptionId) {
+                    logger.info(`School ${schoolId} already has ${existingActiveBilling.status} subscription ${existingActiveBilling.stripeSubscriptionId}`);
+                    
+                    // Fetch the current subscription from Stripe to return
+                    const subscription = await this.stripe.subscriptions.retrieve(existingActiveBilling.stripeSubscriptionId);
+                    return { subscription, billing: existingActiveBilling };
+                } else if (existingActiveBilling.status === 'active') {
+                    // Free access billing already exists
+                    logger.info(`School ${schoolId} already has active free access billing`);
+                    return { subscription: null, billing: existingActiveBilling };
+                }
+            }
+            
+            // Check for any existing subscription in Stripe (safety check)
+            const existingStripeCustomer = await this.getSchoolStripeCustomerId(schoolId);
+            if (existingStripeCustomer) {
+                const existingSubscriptions = await this.stripe.subscriptions.list({
+                    customer: existingStripeCustomer,
+                    status: 'all', // Check all statuses including incomplete
+                    limit: 10
+                });
+                
+                // Check for active, incomplete, or trialing subscriptions
+                const activeOrPendingSubscription = existingSubscriptions.data.find((sub: Stripe.Subscription) => 
+                    sub.status === 'active' || sub.status === 'incomplete' || sub.status === 'trialing'
+                );
+                
+                if (activeOrPendingSubscription) {
+                    logger.warn(`School ${schoolId} has existing ${activeOrPendingSubscription.status} Stripe subscription ${activeOrPendingSubscription.id} - returning existing subscription`);
+                    
+                    // Update our database to match Stripe
+                    const billing = await transactionalEntityManager.findOne(SchoolBilling, {
+                        where: { schoolId: schoolId },
+                        order: { createdAt: 'DESC' }
+                    });
+                    
+                    if (billing) {
+                        await transactionalEntityManager.update(SchoolBilling,
+                            { id: billing.id },
+                            { 
+                                stripeSubscriptionId: activeOrPendingSubscription.id,
+                                status: activeOrPendingSubscription.status
+                            }
+                        );
+                        const updatedBilling = await transactionalEntityManager.findOneByOrFail(SchoolBilling, { id: billing.id });
+                        return { subscription: activeOrPendingSubscription, billing: updatedBilling };
+                    }
+                }
+            }
+            
+            const currentStudentCount = await this.getSchoolStudentCount(schoolId);
+            
+            // For billing: Always use cap as quantity for Stripe subscription
+            // For actual charging: Always charge for full cap upfront (prepaid system)
+            const billingQuantity = Math.max(school.studentCap, 1); // For Stripe subscription setup
+            const chargeAmount = school.studentCap; // Always charge for full cap upfront
+            
+            // Get school billing rate and check if it's free
+            const rate = this.getSchoolBillingRate(school);
+            
+            // Check if school already has existing billing
+            const existingBilling = await transactionalEntityManager.findOne(SchoolBilling, {
+                where: { schoolId: schoolId },
+                order: { createdAt: 'DESC' },
+            });
+            
+            // Handle free schools - but allow them to upgrade to paid if they explicitly want to
+            if (rate === 0 && !forceUpgradeFromFree) {
+                // If they already have a paid subscription, don't downgrade them
+                if (existingBilling?.stripeSubscriptionId) {
+                    logger.info(`School ${schoolId} has free rate but existing paid subscription - keeping paid subscription`);
+                    return { subscription: null, billing: existingBilling };
+                }
+                
+                const now = new Date();
+                const oneYearFromNow = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+                
+                const billing = transactionalEntityManager.create(SchoolBilling, {
+                    id: genId(),
+                    schoolId: schoolId,
+                    stripeCustomerId: null, // No Stripe customer needed for free schools
+                    stripeSubscriptionId: null, // No Stripe subscription for free schools
+                    billingMode: 'prepaid_cap', // Always prepaid cap mode
+                    billedStudentCap: school.studentCap, // Track the cap we're billing for
+                    studentCount: currentStudentCount, // Current actual student count
+                    pricePerStudent: 0,
+                    totalAmount: 0,
+                    billingCycle: 'annual',
+                    status: 'active', // Free schools are automatically active
+                    currentPeriodStart: now,
+                    currentPeriodEnd: oneYearFromNow,
+                    nextPaymentDate: null, // No payment needed
+                    lastPaymentDate: null,
+                    paymentMethod: null,
+                    metadata: {
+                        created_via: 'api',
+                        free_access: true,
+                        initial_student_count: currentStudentCount,
+                        admin_override: school.metadata?.adminOverride || false,
+                    },
+                });
+                
+                await transactionalEntityManager.save(billing);
+                
+                // Update school subscription status
+                await transactionalEntityManager.update(School, { id: schoolId }, { 
+                    subscriptionStatus: 'active', // Free schools are immediately active
+                });
+                
+                logger.info(`Created free access billing for school ${schoolId} with ${currentStudentCount} students`);
+                
+                return { subscription: null, billing };
+            }
+            
+            // For paid subscriptions or free schools that want to upgrade
+            let effectiveRate = rate;
+            if (forceUpgradeFromFree && rate === 0) {
+                // When upgrading from free, check if there's a custom rate configured
+                // Look for custom rate or discount in metadata (ignoring admin override)
+                if (school.metadata?.customBillingRate) {
+                    effectiveRate = school.metadata.customBillingRate;
+                    logger.info(`School ${schoolId} upgrading from free to custom rate: $${effectiveRate}/student`);
+                } else if (school.metadata?.discountPercentage) {
+                    const discount = school.metadata.discountPercentage / 100;
+                    effectiveRate = Math.round((1.25 * (1 - discount)) * 100) / 100;
+                    logger.info(`School ${schoolId} upgrading from free to discounted rate: $${effectiveRate}/student (${school.metadata.discountPercentage}% off)`);
+                } else {
+                    // No custom rate configured, use standard rate
+                    effectiveRate = 1.25;
+                    logger.info(`School ${schoolId} upgrading from free to standard rate: $1.25/student`);
+                }
+            }
+            
+            // Get or create Stripe customer for paid schools
+            let customerId = await this.getSchoolStripeCustomerId(schoolId);
+            if (!customerId) {
+                customerId = await this.createSchoolCustomer(school);
+            }
+            
+            // Determine if we need custom pricing (use effectiveRate for calculations)
+            const isStandardRate = effectiveRate === 1.25;
+            
+            let priceId: string;
+            
+            // Use the cached method to get or create price
+            priceId = await this.getOrCreateStripePrice(effectiveRate);
+            
+            // Create subscription with quantity-based billing
+            // For schools with 0 students, we still need a subscription for infrastructure but shouldn't charge
+            let subscriptionParams: Stripe.SubscriptionCreateParams = {
+                customer: customerId,
+                items: [{
+                    price: priceId,
+                    quantity: billingQuantity, // Use minimum of 1 for billing setup
+                }],
+                metadata: {
+                    schoolId: school.id,
+                    studentCount: currentStudentCount.toString(),
+                    billingQuantity: billingQuantity.toString(),
+                    actualChargeAmount: chargeAmount.toString(),
+                    type: 'school_subscription',
+                },
+                expand: ['latest_invoice.payment_intent'],
+                payment_behavior: 'default_incomplete', // Allow incomplete subscription creation for setup
+                collection_method: 'charge_automatically',
+            };
+
+            // For schools with 0 students, start with trial period to avoid immediate charge
+            if (currentStudentCount === 0) {
+                subscriptionParams.trial_end = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60); // 7 day trial
+                subscriptionParams.metadata.trial_duration_days = '7';
+                subscriptionParams.metadata.zero_student_trial = 'true';
+            }
+            
+            if (paymentMethodId) {
+                subscriptionParams.default_payment_method = paymentMethodId;
+                // Keep 'default_incomplete' behavior even with payment method for setup flexibility
+                // This allows schools to set up billing infrastructure without immediate payment
+            }
+            
+            const subscription = await this.stripe.subscriptions.create(subscriptionParams);
+            
+            // Create billing record - use proper date handling
+            const now = new Date();
+            const oneYearFromNow = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+            
+            const billing = transactionalEntityManager.create(SchoolBilling, {
+                id: genId(),
+                schoolId: schoolId,
+                stripeCustomerId: customerId,
+                stripeSubscriptionId: subscription.id,
+                billingMode: 'prepaid_cap', // Always prepaid cap mode
+                billedStudentCap: school.studentCap, // Track the cap we're billing for
+                studentCount: currentStudentCount, // Current actual student count
+                pricePerStudent: effectiveRate,
+                totalAmount: chargeAmount * effectiveRate, // Bill for full cap amount
+                billingCycle: 'annual',
+                status: subscription.status,
+                currentPeriodStart: subscription.current_period_start 
+                    ? new Date(subscription.current_period_start * 1000) 
+                    : now,
+                currentPeriodEnd: subscription.current_period_end 
+                    ? new Date(subscription.current_period_end * 1000) 
+                    : oneYearFromNow,
+                nextPaymentDate: subscription.current_period_end 
+                    ? new Date(subscription.current_period_end * 1000) 
+                    : oneYearFromNow,
+                lastPaymentDate: null,
+                paymentMethod: null,
+                metadata: {
+                    created_via: 'api',
+                    initial_student_count: currentStudentCount,
+                    initial_billing_quantity: billingQuantity,
+                    upgraded_from_free: forceUpgradeFromFree,
+                    original_admin_override: forceUpgradeFromFree ? (school.metadata?.adminOverride || false) : undefined,
+                },
+            });
+            
+            await transactionalEntityManager.save(billing);
+            
+            // If this is an upgrade from free, mark the school as having a paid subscription despite free access
+            if (forceUpgradeFromFree) {
+                await transactionalEntityManager.update(School, { id: schoolId }, {
+                    metadata: {
+                        ...school.metadata,
+                        paidSubscriptionDespiteFree: true,
+                        paidSubscriptionCreatedAt: new Date().toISOString(),
+                    },
+                    subscriptionStatus: 'active', // Ensure subscription is active
+                });
+                logger.info(`School ${schoolId} upgraded from free to paid subscription`);
+            } else {
+                // Update school subscription status
+                // For schools with valid billing setup, mark as active regardless of Stripe subscription status
+                // The subscription status will be updated by webhooks if needed
+                await transactionalEntityManager.update(School, { id: schoolId }, { 
+                    subscriptionStatus: 'active',
+                });
+            }
+            
+            logger.info(`Created subscription ${subscription.id} for school ${schoolId} with ${currentStudentCount} students (billing quantity: ${billingQuantity})`);
+            
+            return { subscription, billing };
+        });
+    }
+    
+    /**
+     * Update subscription when student count changes
+     */
+    async updateSchoolSubscription(schoolId: string): Promise<void> {        const billing = await SchoolBillings.findOneBy({
+            schoolId: schoolId,
+            status: 'active',
+        });
+        
+        if (!billing) {
+            logger.warn(`No active billing found for school ${schoolId}`);
+            return;
+        }
+        
+        const currentStudentCount = await this.getSchoolStudentCount(schoolId);
+        
+        if (currentStudentCount === billing.studentCount) {
+            logger.info(`Student count unchanged for school ${schoolId}`);
+            return;
+        }
+        
+        // Handle free schools (no Stripe subscription)
+        if (!billing.stripeSubscriptionId) {
+            // For free schools, just update the student count in the billing record
+            await SchoolBillings.update({ id: billing.id }, {
+                studentCount: currentStudentCount,
+                totalAmount: 0, // Free schools always have 0 cost
+                metadata: {
+                    ...billing.metadata,
+                    updated_at: new Date().toISOString(),
+                    previous_student_count: billing.studentCount,
+                },
+            });
+            
+            logger.info(`Updated free billing for school ${schoolId}: ${billing.studentCount} → ${currentStudentCount} students`);
+            return;
+        }
+        
+        // Use minimum billing quantity of 1 for Stripe subscription management
+        // Use actual student count for billing amount calculation
+        const billingQuantity = Math.max(currentStudentCount, 1);
+        const chargeAmount = currentStudentCount;
+        
+        // Get current rate per student from billing record  
+        const currentRate = billing.pricePerStudent;
+        
+        // For prepaid cap billing, don't charge for individual student increases
+        // The school has already paid for their full cap upfront
+        if (billing.billingMode === 'prepaid_cap') {
+            // Just update the subscription to reflect current usage, no additional charges
+            const subscription = await this.stripe.subscriptions.retrieve(billing.stripeSubscriptionId);
+            
+            // Update subscription metadata to track actual usage vs. cap
+            await this.stripe.subscriptions.update(billing.stripeSubscriptionId, {
+                metadata: {
+                    ...subscription.metadata,
+                    actual_student_count: currentStudentCount.toString(),
+                    billed_student_cap: (billing.billedStudentCap || billing.studentCount).toString(),
+                    updated_at: new Date().toISOString(),
+                },
+            });
+            
+            // Update billing record with current usage
+            await SchoolBillings.update({ id: billing.id }, {
+                studentCount: currentStudentCount,
+                metadata: {
+                    ...billing.metadata,
+                    updated_at: new Date().toISOString(),
+                    previous_student_count: billing.studentCount,
+                    actual_vs_cap: `${currentStudentCount}/${billing.billedStudentCap || billing.studentCount}`,
+                },
+            });
+            
+            logger.info(`Updated prepaid cap billing for school ${schoolId}: ${billing.studentCount} → ${currentStudentCount} students (cap: ${billing.billedStudentCap || billing.studentCount})`);
+            return;
+        }
+        
+        // Legacy per-student billing logic
+        // TODO: Remove this once all schools migrate to prepaid cap billing
+        
+        // Update subscription quantity (for all schools, first year or not)
+        const subscription = await this.stripe.subscriptions.retrieve(billing.stripeSubscriptionId);
+        
+        // Check if this subscription was in trial mode for 0 students and now has students
+        const wasZeroStudentTrial = subscription.metadata?.zero_student_trial === 'true';
+        const subscriptionUpdateParams: any = {
+            items: [{
+                id: subscription.items.data[0].id,
+                quantity: billingQuantity, // Use minimum of 1 for billing
+            }],
+            metadata: {
+                ...subscription.metadata,
+                studentCount: currentStudentCount.toString(),
+                billingQuantity: billingQuantity.toString(),
+                actualChargeAmount: chargeAmount.toString(),
+                updated_at: new Date().toISOString(),
+            },
+        };
+
+        // If moving from 0 students to >0 students, end the trial period
+        if (wasZeroStudentTrial && currentStudentCount > 0) {
+            subscriptionUpdateParams.trial_end = 'now';
+            subscriptionUpdateParams.metadata.zero_student_trial = 'false';
+            logger.info(`Ending trial period for school ${schoolId} - now has ${currentStudentCount} students`);
+        }
+
+        await this.stripe.subscriptions.update(billing.stripeSubscriptionId, subscriptionUpdateParams);
+        
+        // Update billing record
+        await SchoolBillings.update({ id: billing.id }, {
+            studentCount: currentStudentCount,
+            totalAmount: chargeAmount * currentRate, // Use actual student count for billing amount
+            metadata: {
+                ...billing.metadata,
+                updated_at: new Date().toISOString(),
+                previous_student_count: billing.studentCount,
+            },
+        });
+        
+        logger.info(`Updated subscription for school ${schoolId}: ${billing.studentCount} → ${currentStudentCount} students (billing quantity: ${billingQuantity})`);
+    }
+    
+    /**
+     * Suspend school access for non-payment
+     */
+    async suspendSchoolAccess(schoolId: string, reason: string = 'non_payment'): Promise<void> {
+        await Schools.update({ id: schoolId }, {
+            subscriptionStatus: 'suspended',
+            // Store suspension reason in settings
+            settings: {
+                suspension: {
+                    reason: reason,
+                    suspendedAt: new Date().toISOString(),
+                },
+            },
+        });
+        
+        // Enhanced: Also suspend all active student sessions for immediate effect
+        try {
+            const { SchoolAccessManager } = await import('./school-access-manager.js');
+            await SchoolAccessManager.suspendAllSchoolSessions(schoolId);
+        } catch (error: any) {
+            logger.error(`Error suspending school sessions for ${schoolId}: ${error.message}`);
+        }
+        
+        logger.warn(`Suspended access for school ${schoolId}: ${reason}`);
+    }
+    
+    /**
+     * Restore school access after payment
+     */
+    async restoreSchoolAccess(schoolId: string): Promise<void> {
+        await Schools.update({ id: schoolId }, {
+            subscriptionStatus: 'active',
+            settings: {},
+        });
+        
+        logger.info(`Restored access for school ${schoolId}`);
+    }
+    
+    /**
+     * Get school's Stripe customer ID
+     */
+    async getSchoolStripeCustomerId(schoolId: string): Promise<string | null> {
+        const billing = await SchoolBillings.findOneBy({ schoolId });
+        return billing?.stripeCustomerId || null;
+    }
+    
+    /**
+     * Create setup intent for collecting payment method
+     */
+    async createPaymentMethodSetupIntent(customerId: string): Promise<Stripe.SetupIntent> {
+        return await this.stripe.setupIntents.create({
+            customer: customerId,
+            payment_method_types: ['card'],
+            usage: 'off_session',
+        });
+    }
+
+    /**
+     * Attach payment method to subscription
+     */
+    async attachPaymentMethodToSubscription(subscriptionId: string, paymentMethodId: string): Promise<void> {
+        await this.stripe.subscriptions.update(subscriptionId, {
+            default_payment_method: paymentMethodId,
+        });
+    }
+
+    /**
+     * Construct webhook event from raw body and signature
+     */
+    constructWebhookEvent(rawBody: string, signature: string, endpointSecret: string): Stripe.Event {
+        return this.stripe.webhooks.constructEvent(rawBody, signature, endpointSecret);
+    }
+    async handleWebhookEvent(event: Stripe.Event): Promise<void> {
+        logger.info(`Processing webhook event: ${event.type}`);
+        
+        switch (event.type) {
+            case 'invoice.payment_succeeded':
+                await this.handlePaymentSucceeded(event.data.object as Stripe.Invoice);
+                break;
+                
+            case 'invoice.payment_failed':
+                await this.handlePaymentFailed(event.data.object as Stripe.Invoice);
+                break;
+                
+            case 'customer.subscription.updated':
+                await this.handleSubscriptionUpdated(event.data.object as Stripe.Subscription);
+                break;
+                
+            case 'customer.subscription.deleted':
+                await this.handleSubscriptionDeleted(event.data.object as Stripe.Subscription);
+                break;
+                
+            default:
+                logger.info(`Unhandled webhook event type: ${event.type}`);
+        }
+    }
+    
+    private async handlePaymentSucceeded(invoice: Stripe.Invoice): Promise<void> {
+        const schoolId = invoice.metadata?.schoolId;
+        if (!schoolId) return;
+        
+        // Update billing status to active
+        await SchoolBillings.update(
+            { schoolId: schoolId },
+            { 
+                lastPaymentDate: new Date(),
+                status: 'active',
+                metadata: {
+                    last_payment_success: new Date().toISOString(),
+                    payment_retry_count: 0, // Reset retry count on success
+                    immediate_suspension: false, // Clear suspension flag
+                    suspension_reason: null // Clear suspension reason
+                }
+            }
+        );
+        
+        // Restore school access immediately when payment succeeds
+        await this.restoreSchoolAccess(schoolId);
+        logger.info(`Payment succeeded for school ${schoolId} - access restored immediately`);
+    }
+    
+    private async handlePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
+        const schoolId = invoice.metadata?.schoolId;
+        if (!schoolId) return;
+        
+        // Immediately suspend school access and update billing status
+        await SchoolBillings.update(
+            { schoolId: schoolId },
+            { 
+                status: 'suspended', // Immediate suspension
+                metadata: {
+                    last_payment_failure: new Date().toISOString(),
+                    immediate_suspension: true,
+                    suspension_reason: 'payment_failed'
+                }
+            }
+        );
+        
+        // Suspend school access immediately on payment failure
+        // This ensures students cannot access the platform when payments fail
+        await this.suspendSchoolAccess(schoolId, 'payment_failed');
+        
+        logger.warn(`Payment failed for school ${schoolId} - access suspended immediately`);
+    }
+    
+    private async handleSubscriptionUpdated(subscription: Stripe.Subscription): Promise<void> {
+        const schoolId = subscription.metadata?.schoolId;
+        if (!schoolId) return;
+        
+        await SchoolBillings.update(
+            { schoolId: schoolId },
+            { 
+                status: subscription.status,
+                nextPaymentDate: subscription.current_period_end 
+                    ? new Date(subscription.current_period_end * 1000) 
+                    : null,
+            }
+        );
+        
+        // Handle subscription status changes
+        if (subscription.status === 'active') {
+            // Restore access when subscription becomes active
+            await this.restoreSchoolAccess(schoolId);
+            logger.info(`Subscription activated for school ${schoolId} - access restored`);
+        } else if (['canceled', 'incomplete_expired', 'unpaid'].includes(subscription.status)) {
+            // Suspend access for problematic subscription states
+            await this.suspendSchoolAccess(schoolId, `subscription_${subscription.status}`);
+            logger.warn(`Subscription ${subscription.status} for school ${schoolId} - access suspended`);
+        } else {
+            logger.info(`Subscription updated for school ${schoolId}: ${subscription.status}`);
+        }
+    }
+    
+    private async handleSubscriptionDeleted(subscription: Stripe.Subscription): Promise<void> {
+        const schoolId = subscription.metadata?.schoolId;
+        if (!schoolId) return;
+        
+        await this.suspendSchoolAccess(schoolId, 'subscription_cancelled');
+        logger.warn(`Subscription cancelled for school ${schoolId}`);
+    }
+    
+    /**
+     * Update subscription rate when custom billing is changed
+     */
+    async updateSubscriptionRate(schoolId: string): Promise<void> {
+        const billing = await SchoolBillings.findOne({
+            where: { schoolId },
+            order: { createdAt: 'DESC' },
+        });
+
+        const school = await Schools.findOneBy({ id: schoolId });
+        if (!school) {
+            throw new Error('School not found');
+        }
+
+        const newRate = this.getSchoolBillingRate(school);
+
+        // Handle schools without Stripe subscriptions
+        if (!billing?.stripeSubscriptionId) {
+            // Check if this is a free school - if so, no Stripe subscription to update
+            if (newRate === 0) {
+                logger.info(`School ${schoolId} is free - no Stripe subscription needed`);
+                
+                // If billing record exists, update it to reflect free status
+                if (billing) {
+                    await SchoolBillings.update({ id: billing.id }, {
+                        pricePerStudent: 0,
+                        totalAmount: 0,
+                        metadata: {
+                            ...billing.metadata,
+                            rate_updated_at: new Date().toISOString(),
+                            set_to_free_without_subscription: true,
+                        },
+                    });
+                }
+                return;
+            }
+            
+            // School has a paid rate but no subscription yet
+            // This means the rate was set before subscription was created
+            // Update billing record if it exists, otherwise subscription will be created later
+            if (billing) {
+                logger.info(`School ${schoolId} has rate $${newRate} but no Stripe subscription yet - updating billing record`);
+                await SchoolBillings.update({ id: billing.id }, {
+                    pricePerStudent: newRate,
+                    totalAmount: billing.studentCount * newRate,
+                    metadata: {
+                        ...billing.metadata,
+                        rate_updated_at: new Date().toISOString(),
+                        rate_set_before_subscription: true,
+                    },
+                });
+            } else {
+                logger.info(`School ${schoolId} has rate $${newRate} but no billing record - will be created with subscription`);
+            }
+            return;
+        }
+
+        // At this point, we have a valid Stripe subscription
+        const oldRate = billing.pricePerStudent;
+        
+        // If the school is being set to free (rate = 0), don't update the Stripe subscription to $0
+        // Instead, keep the existing subscription but update the billing record
+        if (newRate === 0) {
+            logger.info(`School ${schoolId} is being set to free - keeping existing subscription but marking as free in billing`);
+            
+            // Update billing record to reflect free rate
+            await SchoolBillings.update({ id: billing.id }, {
+                pricePerStudent: 0,
+                totalAmount: 0,
+                metadata: {
+                    ...billing.metadata,
+                    rate_updated_at: new Date().toISOString(),
+                    previous_rate: oldRate,
+                    converted_to_free: true,
+                },
+            });
+            
+            return; // Don't update the actual Stripe subscription
+        }
+        
+        // Calculate prorated amount for mid-cycle rate changes
+        const prorationAmount = await this.calculateProratedBilling(billing.stripeSubscriptionId, newRate, oldRate);
+        
+        // If there's a significant proration amount, create an immediate charge/credit
+        if (Math.abs(prorationAmount) > 0.10) { // Only prorate if difference > $0.10
+            const studentCount = billing.studentCount;
+            const totalProration = prorationAmount * studentCount;
+            
+            if (totalProration > 0) {
+                // Rate increased - charge the difference
+                await this.stripe.invoiceItems.create({
+                    customer: billing.stripeCustomerId,
+                    amount: Math.round(totalProration * 100), // Convert to cents
+                    currency: 'usd',
+                    description: `Prorated charge for rate change: $${oldRate} → $${newRate} per student`,
+                    metadata: {
+                        schoolId: schoolId,
+                        studentCount: studentCount.toString(),
+                        type: 'rate_change_proration',
+                        old_rate: oldRate.toString(),
+                        new_rate: newRate.toString(),
+                        proration_per_student: prorationAmount.toString(),
+                    },
+                });
+                
+                // Create and finalize invoice for immediate payment
+                const invoice = await this.stripe.invoices.create({
+                    customer: billing.stripeCustomerId,
+                    auto_advance: true,
+                    metadata: {
+                        schoolId: schoolId,
+                        type: 'rate_change_proration',
+                    },
+                });
+                
+                logger.info(`Created prorated charge for school ${schoolId}: $${totalProration.toFixed(2)} for rate change $${oldRate} → $${newRate}`);
+            } else {
+                // Rate decreased - create credit for next invoice
+                await this.stripe.invoiceItems.create({
+                    customer: billing.stripeCustomerId,
+                    amount: Math.round(totalProration * 100), // Negative amount = credit
+                    currency: 'usd',
+                    description: `Prorated credit for rate change: $${oldRate} → $${newRate} per student`,
+                    metadata: {
+                        schoolId: schoolId,
+                        studentCount: studentCount.toString(),
+                        type: 'rate_change_proration',
+                        old_rate: oldRate.toString(),
+                        new_rate: newRate.toString(),
+                        proration_per_student: prorationAmount.toString(),
+                    },
+                });
+                
+                logger.info(`Created prorated credit for school ${schoolId}: $${Math.abs(totalProration).toFixed(2)} for rate change $${oldRate} → $${newRate}`);
+            }
+        }
+        
+        // Use the cached method to get or create price
+        const priceId = await this.getOrCreateStripePrice(newRate);
+
+        // Update subscription to use new price
+        const subscription = await this.stripe.subscriptions.retrieve(billing.stripeSubscriptionId);
+        
+        await this.stripe.subscriptions.update(billing.stripeSubscriptionId, {
+            items: [{
+                id: subscription.items.data[0].id,
+                price: priceId,
+                quantity: billing.studentCount, // Keep same quantity
+            }],
+            metadata: {
+                ...subscription.metadata,
+                rate_updated_at: new Date().toISOString(),
+                new_rate: newRate.toString(),
+            },
+        });
+
+        // Update billing record with new rate
+        await SchoolBillings.update({ id: billing.id }, {
+            pricePerStudent: newRate,
+            totalAmount: billing.studentCount * newRate,
+            metadata: {
+                ...billing.metadata,
+                rate_updated_at: new Date().toISOString(),
+                previous_rate: billing.pricePerStudent,
+            },
+        });
+
+        logger.info(`Updated subscription rate for school ${schoolId}: $${billing.pricePerStudent} → $${newRate} per student`);
+    }
+
+    /**
+     * Update subscription to use prepaid cap billing instead of per-student
+     */
+    async updateSchoolSubscriptionToCap(schoolId: string, studentCap: number): Promise<void> {
+        const billing = await SchoolBillings.findOne({
+            where: { schoolId },
+            order: { createdAt: 'DESC' },
+        });
+
+        if (!billing?.stripeSubscriptionId) {
+            logger.warn(`No Stripe subscription found for school ${schoolId} - cannot update to cap billing`);
+            return;
+        }
+
+        const school = await Schools.findOneBy({ id: schoolId });
+        if (!school) {
+            throw new Error('School not found');
+        }
+
+        const rate = this.getSchoolBillingRate(school);
+        
+        // Free schools should not have Stripe subscriptions
+        if (rate === 0) {
+            logger.warn(`School ${schoolId} is free - cannot update Stripe subscription to cap billing`);
+            return;
+        }
+        
+        const newAmount = studentCap * rate;
+
+        // Get or create price for the new cap-based amount
+        const priceId = await this.getOrCreateStripePrice(rate);
+
+        // Update subscription to use the cap quantity instead of actual student count
+        const subscription = await this.stripe.subscriptions.retrieve(billing.stripeSubscriptionId);
+        
+        await this.stripe.subscriptions.update(billing.stripeSubscriptionId, {
+            items: [{
+                id: subscription.items.data[0].id,
+                price: priceId,
+                quantity: studentCap, // Use cap as quantity
+            }],
+            metadata: {
+                ...subscription.metadata,
+                billing_mode: 'prepaid_cap',
+                student_cap: studentCap.toString(),
+                rate_updated_at: new Date().toISOString(),
+            },
+        });
+
+        // Update billing record
+        await SchoolBillings.update({ id: billing.id }, {
+            billingMode: 'prepaid_cap',
+            billedStudentCap: studentCap,
+            totalAmount: newAmount,
+            metadata: {
+                ...billing.metadata,
+                billing_mode_changed_at: new Date().toISOString(),
+                converted_to_cap_billing: true,
+            },
+        });
+
+        logger.info(`Updated school ${schoolId} to cap-based billing: ${studentCap} students at $${rate}/student = $${newAmount}/year`);
+    }
+
+    /**
+     * Create immediate charge for cap increase
+     */
+    async chargeForCapIncrease(schoolId: string, oldCap: number, newCap: number, rate: number): Promise<{ clientSecret: string | null }> {
+        const billing = await SchoolBillings.findOne({
+            where: { schoolId },
+            order: { createdAt: 'DESC' },
+        });
+
+        const additionalStudents = newCap - oldCap;
+        const additionalCost = additionalStudents * rate;
+
+        // No charge needed if cost is zero or negative, or if no Stripe customer yet
+        if (additionalCost <= 0) {
+            return { clientSecret: null };
+        }
+
+        // If no Stripe customer yet, school hasn't activated subscription
+        // They'll be charged when they do activate based on their cap
+        if (!billing?.stripeCustomerId) {
+            logger.info(`School ${schoolId} increased cap to ${newCap} but has no Stripe customer yet - will be charged on activation`);
+            return { clientSecret: null };
+        }
+
+        // Create invoice item for the cap increase
+        await this.stripe.invoiceItems.create({
+            customer: billing.stripeCustomerId,
+            amount: Math.round(additionalCost * 100), // Convert to cents
+            currency: 'usd',
+            description: `Student cap increase: ${oldCap} → ${newCap} students (+${additionalStudents})`,
+            metadata: {
+                schoolId: schoolId,
+                type: 'cap_increase',
+                old_cap: oldCap.toString(),
+                new_cap: newCap.toString(),
+                additional_students: additionalStudents.toString(),
+                rate_per_student: rate.toString(),
+            },
+        });
+
+        // Create and finalize invoice for immediate payment
+        const invoice = await this.stripe.invoices.create({
+            customer: billing.stripeCustomerId,
+            auto_advance: true,
+            metadata: {
+                schoolId: schoolId,
+                type: 'cap_increase_charge',
+            },
+        });
+
+        await this.stripe.invoices.finalizeInvoice(invoice.id);
+
+        logger.info(`Created cap increase charge for school ${schoolId}: $${additionalCost.toFixed(2)} for +${additionalStudents} students`);
+
+        return { 
+            clientSecret: invoice.payment_intent?.client_secret || null 
+        };
+    }
+
+    /**
+     * Calculate billing amount for prepaid cap model
+     */
+    calculateCapBilling(studentCap: number, rate: number): number {
+        return studentCap * rate;
+    }
+
+    /**
+     * Check if student registration should be blocked due to cap
+     */
+    async shouldBlockRegistrationForCap(schoolId: string): Promise<{ blocked: boolean; reason?: string; currentCount?: number; cap?: number }> {
+        const school = await Schools.findOneBy({ id: schoolId });
+        if (!school) {
+            return { blocked: false };
+        }
+
+        // If cap enforcement is disabled, allow registration
+        if (!school.studentCapEnforced || school.studentCap === null) {
+            return { blocked: false };
+        }
+
+        // Get current student count
+        const currentCount = await this.getSchoolStudentCount(schoolId);
+        
+        if (currentCount >= school.studentCap) {
+            return { 
+                blocked: true, 
+                reason: 'STUDENT_CAP_REACHED',
+                currentCount,
+                cap: school.studentCap,
+            };
+        }
+
+        return { blocked: false, currentCount, cap: school.studentCap };
+    }
+
+    // Price cache to prevent duplicate Stripe price creation
+    private static priceCache = new Map<string, string>(); // rate -> priceId
+
+    /**
+     * Get or create Stripe price for a given rate, with caching to prevent duplicates
+     */
+    private async getOrCreateStripePrice(rate: number): Promise<string> {
+        // Don't create $0 prices - this should never happen
+        if (rate === 0) {
+            throw new Error('Cannot create Stripe price for $0 rate - free schools should not have Stripe subscriptions');
+        }
+        
+        // For standard rate, use pre-configured price ID
+        if (rate === 1.25) {
+            const meta = await fetchMeta();
+            if (!meta.stripeSchoolPriceId) {
+                throw new Error('Stripe school price ID not configured in admin settings');
+            }
+            return meta.stripeSchoolPriceId;
+        }
+
+        // For custom rates, check cache first
+        const rateKey = rate.toString();
+        if (StripeSchoolManager.priceCache.has(rateKey)) {
+            const cachedPriceId = StripeSchoolManager.priceCache.get(rateKey)!;
+            
+            // Verify the price still exists in Stripe
+            try {
+                await this.stripe.prices.retrieve(cachedPriceId);
+                return cachedPriceId;
+            } catch (error) {
+                // Price doesn't exist anymore, remove from cache
+                StripeSchoolManager.priceCache.delete(rateKey);
+            }
+        }
+
+        // Create new price and cache it
+        const pricePerStudent = Math.round(rate * 100); // Convert to cents
+        
+        // Additional safety check: ensure price is not zero after rounding
+        if (pricePerStudent <= 0) {
+            logger.error(`Attempted to create Stripe price with $0 amount after rounding. Rate: ${rate}, Rounded: ${pricePerStudent}`);
+            throw new Error(`Cannot create Stripe price for rate $${rate} - rounds to $0 (${pricePerStudent} cents)`);
+        }
+        
+        logger.info(`Creating custom Stripe price: $${rate}/year (${pricePerStudent} cents)`);
+        
+        // Create the product first
+        const product = await this.stripe.products.create({
+            name: `Campra Platform Access - Custom Rate`,
+            description: `Annual platform access per student at $${rate}/year`,
+        });
+
+        // Then create the price with the product ID
+        const customPrice = await this.stripe.prices.create({
+            currency: 'usd',
+            unit_amount: pricePerStudent,
+            recurring: {
+                interval: 'year',
+            },
+            product: product.id,
+        });
+        
+        logger.info(`Created Stripe price ${customPrice.id} for rate $${rate}/year`);
+
+        StripeSchoolManager.priceCache.set(rateKey, customPrice.id);
+        return customPrice.id;
+    }
+
+    /**
+     * Calculate prorated billing when rate changes mid-cycle
+     */
+    private async calculateProratedBilling(subscriptionId: string, newRate: number, oldRate: number): Promise<number> {
+        const subscription = await this.stripe.subscriptions.retrieve(subscriptionId);
+        
+        const currentPeriodStart = new Date(subscription.current_period_start * 1000);
+        const currentPeriodEnd = new Date(subscription.current_period_end * 1000);
+        const now = new Date();
+        
+        // Calculate remaining days in current billing period
+        const totalDays = Math.ceil((currentPeriodEnd.getTime() - currentPeriodStart.getTime()) / (1000 * 60 * 60 * 24));
+        const remainingDays = Math.ceil((currentPeriodEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+        
+        if (remainingDays <= 0) {
+            return 0; // No proration needed if period has ended
+        }
+        
+        // Calculate proration amount
+        const dailyOldRate = oldRate / 365;
+        const dailyNewRate = newRate / 365;
+        const prorationAmount = (dailyNewRate - dailyOldRate) * remainingDays;
+        
+        logger.info(`Proration calculation for subscription ${subscriptionId}: ${remainingDays}/${totalDays} days remaining, rate change $${oldRate} → $${newRate}, proration: $${prorationAmount.toFixed(2)}`);
+        
+        return Math.round(prorationAmount * 100) / 100; // Round to 2 decimal places
+    }
+}
+
+export default StripeSchoolManager;

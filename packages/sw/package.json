@@ -1,0 +1,19 @@
+{
+	"name": "sw",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"watch": "node build.js watch",
+		"build": "node build.js",
+		"lint": "eslint --quiet \"src/**/*.ts\""
+	},
+	"dependencies": {
+		"calckey-js": "^0.0.20",
+		"esbuild": "^0.15.18",
+		"idb-keyval": "^6.2.0",
+		"js-yaml": "^4.1.0"
+	},
+	"devDependencies": {
+		"eslint": "^8.31.0"
+	}
+}

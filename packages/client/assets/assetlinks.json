@@ -1,0 +1,21 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "chat.campra.app",
+      "sha256_cert_fingerprints": [
+        "3E:C7:9C:F0:79:23:2D:6C:F7:7F:77:B1:3E:C6:69:4E:1B:47:2C:13:39:52:EC:C2:07:E5:EA:D0:70:41:C5:EB"
+      ],
+      "paths": [
+        "/*",
+        "!/verify-email/*",
+        "!/miauth/*",
+        "!/statusbar",
+        "!/sounds",
+        "!/plugin/*",
+        "!/api/*"
+      ]
+    }
+  }
+]

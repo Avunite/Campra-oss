@@ -1,0 +1,11 @@
+- Add channel mods/admins done
+- Add channel archive done
+- Add channels notes delete done
+- Add channel user banned done
+- Add channel user unban done
+- Add channel tags (requires either new DB table or new DB entry) 
+- Add note tags if posted to channel
+- Make api return note tags
+- Update Ui to make it so users can use new features
+
+remove all @/remote/
