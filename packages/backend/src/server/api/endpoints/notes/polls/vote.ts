@@ -62,7 +62,6 @@ export const paramDef = {
     required: ['noteId', 'choice'],
 } as const;
 
-// eslint-disable-next-line import/no-default-export
 export default define(meta, paramDef, async (ps, user) => {
     const createdAt = new Date();
 
@@ -122,9 +121,12 @@ export default define(meta, paramDef, async (ps, user) => {
         choice: ps.choice,
     }).then(x => PollVotes.findOneByOrFail(x.identifiers[0]));
 
-    // Increment votes count
-    const index = ps.choice + 1; // In SQL, array index is 1 based
-    await Polls.query(`UPDATE poll SET votes[${index}] = votes[${index}] + 1 WHERE "noteId" = '${poll.noteId}'`);
+    // Increment votes count using TypeORM's save method - safe from SQL injection
+    const index = ps.choice;
+    const updatedPoll = await Polls.findOneByOrFail({ noteId: poll.noteId });
+    if (!updatedPoll.votes) updatedPoll.votes = [];
+    updatedPoll.votes[index] = (updatedPoll.votes[index] || 0) + 1;
+    await Polls.save(updatedPoll);
 
     publishNoteStream(note.id, 'pollVoted', {
         choice: ps.choice,
